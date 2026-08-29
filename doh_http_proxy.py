@@ -1250,6 +1250,17 @@ def _read_key() -> int:
     return key[0]
 
 
+def wait_for_menu_key() -> None:
+    print("Press any key to return to the main menu.", end="", flush=True)
+
+    try:
+        _read_key()
+    except KeyboardInterrupt:
+        pass
+
+    print()
+
+
 def clear_screen() -> None:
     os.system("cls" if os.name == "nt" else "clear")
 
@@ -1426,12 +1437,24 @@ def launch_elevated(script_path: str, config_path: str) -> bool:
     if os.name != "nt":
         return False
 
-    script_path = os.path.abspath(script_path)
-    params = f'"{script_path}" --config-file "{config_path}"'
+    # PyInstaller's one-file bootloader sets ``__file__`` to the extracted
+    # temporary script inside ``_MEI...``.  That path is not a command-line
+    # entry point for the frozen executable: passing it to ``sys.executable``
+    # makes argparse interpret it as an unknown argument.  A source run still
+    # needs the script path, while a frozen run must launch the executable
+    # directly and pass only the application arguments.
+    if getattr(sys, "frozen", False):
+        executable = sys.executable
+        params = f'--config-file "{os.path.abspath(config_path)}"'
+    else:
+        executable = sys.executable
+        script_path = os.path.abspath(script_path)
+        params = f'"{script_path}" --config-file "{os.path.abspath(config_path)}"'
+
     result = ctypes.windll.shell32.ShellExecuteW(
         None,
         "runas",
-        sys.executable,
+        executable,
         params,
         None,
         1,
@@ -1798,6 +1821,10 @@ def should_show_menu(args: argparse.Namespace) -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty() and not getattr(args, "config_file", None)
 
 
+def should_return_to_menu_after_session(started_with_config_file: bool) -> bool:
+    return started_with_config_file and sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def maybe_apply_system_proxy(config: StartupConfig) -> Optional[WindowsSystemProxyManager]:
     if not config.set_system_proxy:
         return None
@@ -2045,6 +2072,7 @@ def run_interactive_menu(config: StartupConfig) -> int:
                     if result == 0:
                         message = "Proxy stopped. Back to main menu."
                     else:
+                        wait_for_menu_key()
                         message = f"Proxy exited with code {result}."
                     continue
                 except KeyboardInterrupt:
@@ -3443,6 +3471,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
+    started_with_config_file = bool(args.config_file)
 
     if args.config_file:
         try:
@@ -3458,7 +3487,15 @@ def main() -> int:
         return run_interactive_menu(startup_config)
 
     try:
-        return start_proxy_session(namespace_from_startup_config(startup_config))
+        result = start_proxy_session(namespace_from_startup_config(startup_config))
+
+        if should_return_to_menu_after_session(started_with_config_file):
+            if result != 0:
+                wait_for_menu_key()
+
+            return run_interactive_menu(startup_config)
+
+        return result
     except PortInUseError as exc:
         print(
             f"{exc.listen}:{exc.port} is already in use by PID(s): "
@@ -3467,9 +3504,19 @@ def main() -> int:
         )
         for detail in exc.details:
             print(f"  {detail}", file=sys.stderr)
+
+        if should_return_to_menu_after_session(started_with_config_file):
+            wait_for_menu_key()
+            return run_interactive_menu(startup_config)
+
         return 2
     except OSError as exc:
         print(f"Failed to start proxy: {exc}", file=sys.stderr)
+
+        if should_return_to_menu_after_session(started_with_config_file):
+            wait_for_menu_key()
+            return run_interactive_menu(startup_config)
+
         return 2
 
 
